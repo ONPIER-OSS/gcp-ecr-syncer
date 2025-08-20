@@ -17,18 +17,15 @@ class AWSConfig(BaseModel):
     region: str
     role_arn: str
     oidc_token_path: str
+    ecr_username: str
 
 
 class GCPConfig(BaseModel):
     project_id: str
     location: str
     secret_name: str
-    repository: str
+    repository_name: str
     ...
-
-
-class ECRConfig(BaseModel):
-    username: str
 
 
 class Config(BaseSettings):
@@ -37,7 +34,6 @@ class Config(BaseSettings):
     debug: bool = False
     aws: AWSConfig
     gcp: GCPConfig
-    ecr: ECRConfig
 
 
 def setup_logging(cfg: Config):
@@ -197,12 +193,12 @@ def update_remote_repository(cfg: Config, secret_version_name: str) -> bool:
     """
     logger.info("Updating Artifact Registry remote repository")
     client = artifactregistry_v1.ArtifactRegistryClient()
-    name = f"projects/{cfg.gcp.project_id}/locations/{cfg.gcp.location}/repositories/{cfg.gcp.repository}"
+    name = f"projects/{cfg.gcp.project_id}/locations/{cfg.gcp.location}/repositories/{cfg.gcp.repository_name}"
 
     remote_repository_config = artifactregistry_v1.RemoteRepositoryConfig(
         upstream_credentials=artifactregistry_v1.RemoteRepositoryConfig.UpstreamCredentials(
             username_password_credentials=artifactregistry_v1.RemoteRepositoryConfig.UpstreamCredentials.UsernamePasswordCredentials(
-                username=cfg.ecr.username,
+                username=cfg.aws.ecr_username,
                 password_secret_version=secret_version_name,
             )
         )
