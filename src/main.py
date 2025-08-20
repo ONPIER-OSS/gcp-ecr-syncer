@@ -1,11 +1,15 @@
 import base64
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional, cast
 
 import boto3
+import google.oauth2.id_token
 from botocore.exceptions import ClientError
+from google.auth import exceptions
+from google.auth.transport import requests as grequests
 from google.cloud import artifactregistry_v1, secretmanager
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,7 +20,8 @@ logger = logging.getLogger(__name__)
 class AWSConfig(BaseModel):
     region: str
     role_arn: str
-    oidc_token_path: str
+    oidc_token_path: Optional[str] = None
+    audience: Optional[str] = None
     ecr_username: str
 
 
@@ -25,7 +30,6 @@ class GCPConfig(BaseModel):
     location: str
     secret_name: str
     repository_name: str
-    ...
 
 
 class Config(BaseSettings):
@@ -37,13 +41,7 @@ class Config(BaseSettings):
 
 
 def setup_logging(cfg: Config):
-    """
-    Sets up logging configuration based on the provided configuration.
-
-    Args:
-        cfg (Config): The configuration object. If `debug` is True, the logging
-                      level is set to DEBUG; otherwise, it's set to INFO.
-    """
+    """Sets up logging configuration."""
     if cfg.debug:
         logger.setLevel(logging.DEBUG)
     else:
@@ -54,47 +52,74 @@ def setup_logging(cfg: Config):
     logger.addHandler(handler)
 
 
+def _get_oidc_token(cfg: Config) -> str:
+    """
+    Retrieves the OIDC token based on the environment.
+
+    - If `aws.oidc_token_path` is set and the file exists, it reads the token
+      from the file (GKE Workload Identity).
+    - Otherwise, it generates an OIDC token for the ambient GCP Service Account
+      (Cloud Run, etc.), using `aws.audience` as the target audience.
+
+    Returns:
+        str: The OIDC token.
+    """
+    # GKE Workload Identity Method (File-based)
+    if cfg.aws.oidc_token_path and os.path.exists(cfg.aws.oidc_token_path):
+        logger.info(
+            f"GKE environment detected. Reading token from {cfg.aws.oidc_token_path}"
+        )
+        try:
+            with open(cfg.aws.oidc_token_path, "r") as f:
+                return f.read()
+        except FileNotFoundError:
+            logger.error(
+                f"Service account token file not found at {cfg.aws.oidc_token_path}."
+            )
+            raise
+    # GCP Service Account Method (Cloud Run, etc.)
+    else:
+        logger.info("Cloud Run/GCP environment detected. Generating OIDC token.")
+        if not cfg.aws.audience:
+            raise ValueError(
+                "AWS_AUDIENCE must be configured for the Cloud Run/GCP environment."
+            )
+        try:
+            auth_req = grequests.Request()
+            oidc_token = google.oauth2.id_token.fetch_id_token(
+                auth_req, cfg.aws.audience
+            )
+            if not oidc_token:
+                raise RuntimeError("Failed to fetch OIDC token: received None.")
+
+            return oidc_token
+        except exceptions.DefaultCredentialsError as e:
+            logger.error(
+                "Could not find default credentials. Ensure the service account is configured correctly."
+            )
+            raise e
+
+
 def get_login_password(cfg: Config) -> bytes:
     """
     Retrieves an authorization token from AWS ECR by first assuming a role
-    via GKE Workload Identity Federation.
-
-    Args:
-        cfg (Config): The configuration object containing AWS settings like
-                      ROLE_ARN and REGION.
-
-    Returns:
-        bytes: The extracted login password from the authorization token.
-
-    Raises:
-        ClientError: If an error occurs during the AWS API calls.
-        Exception: If the token format is invalid or files are missing.
+    via GCP Workload Identity Federation (supports GKE and Cloud Run).
     """
     logger.info("Starting Workload Identity Federation flow to get ECR password")
 
-    # Path to the projected service account token in GKE
-    token_path = cfg.aws.oidc_token_path
-
-    # 1. Read the OIDC token from the GKE-provided file
     try:
-        with open(token_path, "r") as f:
-            web_identity_token = f.read()
-    except FileNotFoundError:
-        logger.error(
-            f"Service account token file not found at {token_path}. Is Workload Identity configured for this pod?"
-        )
+        web_identity_token = _get_oidc_token(cfg)
+        logger.debug("Successfully retrieved the web identity token.")
+    except Exception as e:
+        logger.error(f"Failed to get OIDC token: {e}", exc_info=True)
         raise
 
-    logger.debug("Successfully read the web identity token.")
-
-    # 2. Assume the AWS role using the GKE token
     sts_client = boto3.client("sts", region_name=cfg.aws.region)
-
     try:
         logger.info(f"Attempting to assume role: {cfg.aws.role_arn}")
         assumed_role_object = sts_client.assume_role_with_web_identity(
             RoleArn=cfg.aws.role_arn,
-            RoleSessionName="ECRTokenRefreshSession",  # A descriptive session name
+            RoleSessionName="ECRTokenRefreshSession",
             WebIdentityToken=web_identity_token,
         )
         logger.info("Successfully assumed AWS role.")
@@ -103,15 +128,13 @@ def get_login_password(cfg: Config) -> bytes:
             "Failed to assume AWS role. Error Message:\n%s",
             err.response["Error"]["Message"],
         )
-        logger.error(
-            "Check IAM role trust relationship and GKE Workload Identity setup."
-        )
+        logger.error("Check IAM role trust relationship and Workload Identity setup.")
         raise
 
-    # 3. Extract temporary credentials from the assumed role
+    # 3. Extract temporary credentials
     credentials = assumed_role_object["Credentials"]
 
-    # 4. Create the ECR client using the temporary credentials
+    # 4. Create the ECR client with temporary credentials
     logger.info("Creating ECR client with temporary credentials.")
     ecr_client = boto3.client(
         "ecr",
@@ -145,17 +168,6 @@ def get_login_password(cfg: Config) -> bytes:
 def store_login_password(cfg: Config, login_password: bytes) -> Optional[str]:
     """
     Stores the ECR login password in Google Cloud Secrets Manager.
-
-    Args:
-        cfg (Config): The configuration object containing GCP settings like
-                      PROJECT_ID and SECRET_NAME.
-        login_password (bytes): The ECR login password to store.
-
-    Returns:
-        str: The name of the newly created secret version. Returns None on error.
-
-    Raises:
-        Exception: If an error occurs while storing the login password in Secrets Manager.
     """
     logger.info("Storing ECR login password in Secrets Manager")
     client = secretmanager.SecretManagerServiceClient()
@@ -179,17 +191,6 @@ def store_login_password(cfg: Config, login_password: bytes) -> Optional[str]:
 def update_remote_repository(cfg: Config, secret_version_name: str) -> bool:
     """
     Updates the Artifact Registry remote repository with the new ECR login password.
-
-    Args:
-        cfg (Config): The configuration object containing GCP and ECR settings.
-        secret_version_name (str): The name of the secret version in Secrets Manager
-                                     containing the ECR login password.
-
-    Returns:
-        bool: True if the update was successful, False otherwise.
-
-    Raises:
-        Exception: If an error occurs while updating the Artifact Registry repository.
     """
     logger.info("Updating Artifact Registry remote repository")
     client = artifactregistry_v1.ArtifactRegistryClient()
@@ -227,10 +228,6 @@ def update_remote_repository(cfg: Config, secret_version_name: str) -> bool:
 def cleanup_old_secret_versions(cfg: Config, hours: int = 12) -> None:
     """
     Destroys secret versions older than a specified number of hours.
-
-    Args:
-        cfg (Config): The configuration object containing GCP settings.
-        hours (int): The number of hours after which secret versions should be destroyed.
     """
     logger.info(f"Cleaning up secret versions older than {hours} hours")
     client = secretmanager.SecretManagerServiceClient()
@@ -276,12 +273,6 @@ def main(cfg: Config) -> bool:
     """
     Main function to orchestrate the process of getting an ECR login password,
     storing it in Secrets Manager, and updating the Artifact Registry remote repository.
-
-    Args:
-        cfg (Config): The configuration object for AWS and GCP.
-
-    Returns:
-        bool: True if all operations were successful, False otherwise.
     """
     try:
         login_password = get_login_password(cfg)
