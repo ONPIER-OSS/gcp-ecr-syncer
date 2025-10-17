@@ -2,7 +2,9 @@ import base64
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
+from logging import Formatter
 from typing import Optional, cast
 
 import boto3
@@ -13,6 +15,7 @@ from google.auth.transport import requests as grequests
 from google.cloud import artifactregistry_v1, secretmanager
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pythonjsonlogger import json
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +39,64 @@ class Config(BaseSettings):
     model_config = SettingsConfigDict(env_nested_delimiter="_", env_nested_max_split=1)
 
     debug: bool = False
+    enable_cloud_logging_integration: bool = False
     aws: AWSConfig
     gcp: GCPConfig
 
 
+class CloudLoggingJsonFormatter(json.JsonFormatter):
+    """
+    Custom JSON formatter to create structured logs for Google Cloud.
+    - Adds a 'timestamp' field in UTC RFC 3339 format.
+    - Renames 'levelname' to 'severity'.
+    - Creates a nested 'logging.googleapis.com/sourceLocation' object.
+    """
+
+    def add_fields(self, log_data, record, message_dict):
+        super().add_fields(log_data, record, message_dict)
+
+        if "asctime" in log_data:
+            log_data["timestamp"] = log_data.pop("asctime")
+
+        if "levelname" in log_data:
+            log_data["severity"] = log_data.pop("levelname")
+
+        if "pathname" in log_data:
+            log_data["logging.googleapis.com/sourceLocation"] = {
+                "file": log_data.pop("pathname"),
+                "line": log_data.pop("lineno"),
+                "function": log_data.pop("funcName"),
+            }
+
+
 def setup_logging(cfg: Config):
-    """Sets up logging configuration."""
+    """Sets up logging, supporting both standard text and structured JSON."""
+    logger.propagate = False
+    logger.handlers.clear()
+
     if cfg.debug:
         logger.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.INFO)
+
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    formatter: Formatter
+    if cfg.enable_cloud_logging_integration:
+        log_format = (
+            "%(asctime)s %(levelname)s %(message)s %(pathname)s %(lineno)s %(funcName)s"
+        )
+
+        formatter = CloudLoggingJsonFormatter(
+            fmt=log_format,
+            datefmt="%Y-%m-%dT%H:%M:%S.%fZ",  # RFC 3339 format
+        )
+        formatter.converter = time.gmtime
+
+        logger.info("Cloud Logging integration enabled. Using structured JSON logging.")
+    else:
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
