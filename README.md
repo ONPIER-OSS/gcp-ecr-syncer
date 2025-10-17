@@ -71,21 +71,34 @@ Ensure the following Google Cloud APIs are enabled in your project:
 
 The application uses environment variables for its configuration.
 
-| Variable              | Description                                        | Example Value        |
-| :-------------------- | :------------------------------------------------- | :------------------- |
-| `DEBUG`               | Set to `True` for verbose logging.                 | `False`              |
-| `AWS_REGION`          | The AWS region of your ECR repository.             | `us-east-1`          |
-| `AWS_ROLE_ARN`        | The ARN of the IAM Role created in AWS.            | `arn:aws:iam::123456789012:role/gcp-ecr-token-refresher-role` |
-| `AWS_ECR_USERNAME`    | Username for ECR auth; almost always `AWS`.        | `AWS`                |
-| `GCP_PROJECT_ID`      | The ID of your Google Cloud project.               | `my-gcp-project-id`  |
-| `GCP_LOCATION`        | The GCP region for your Secret and repo.           | `europe-west1`       |
-| `GCP_SECRET_NAME`     | The name of the secret in Secret Manager.          | `ecr-login-password` |
-| `GCP_REPOSITORY_NAME` | Name of the remote Artifact Registry repo.         | `my-ecr-remote-repo` |
-| **For Cloud Run:** |                                                    |                      |
-| `AWS_AUDIENCE`        | OIDC token audience. Must match AWS OIDC provider. | `sts.amazonaws.com`  |
-| **For GKE:** |                                                    |                      |
-| `AWS_OIDC_TOKEN_PATH` | Path to GKE OIDC token; detects GKE environment.   | `/var/run/secrets/sts.googleapis.com/service-account-token`     |
+| Variable                           | Description                                                        | Example Value        |
+| :--------------------------------- | :----------------------------------------------------------------- | :------------------- |
+| `DEBUG`                            | Set to yt `True` for verbose logging.                              | `False`              |
+| `ENABLE_CLOUD_LOGGING_INTEGRATION` | Set to `True` to enable structured JSON logging for Cloud Logging. | `True`               |
+| `AWS_REGION`                       | The AWS region of your ECR repository.                             | `us-east-1`          |
+| `AWS_ROLE_ARN`                     | The ARN of the IAM Role created in AWS.                            | `arn:aws:iam::123456789012:role/gcp-ecr-token-refresher-role` |
+| `AWS_ECR_USERNAME`                 | Username for ECR auth; almost always `AWS`.                        | `AWS`                |
+| `GCP_PROJECT_ID`                   | The ID of your Google Cloud project.                               | `my-gcp-project-id`  |
+| `GCP_LOCATION`                     | The GCP region for your Secret and repo.                           | `europe-west1`       |
+| `GCP_SECRET_NAME`                  | The name of the secret in Secret Manager.                          | `ecr-login-password` |
+| `GCP_REPOSITORY_NAME`              | Name of the remote Artifact Registry repo.                         | `my-ecr-remote-repo` |
+| **For Cloud Run:**                 |                                                                    |                      |
+| `AWS_AUDIENCE`                     | OIDC token audience. Must match AWS OIDC provider.                 | `sts.amazonaws.com`  |
+| **For GKE:**                       |                                                                    |                      |
+| `AWS_OIDC_TOKEN_PATH`              | Path to GKE OIDC token; detects GKE environment.                   | `/var/run/secrets/sts.googleapis.com/service-account-token`     |
 
 **Note:** When running on Cloud Run, **do not set** `AWS_OIDC_TOKEN_PATH`. The
 application detects its absence and generates a token for the attached GCP
 Service Account.
+
+## Logging Configuration
+
+The application supports two logging modes:
+
+1. **Standard Text Logging (Default)**: Simple, human-readable logs suitable for
+    local development.
+2. **Structured JSON Logging**: When ENABLE_CLOUD_LOGGING_INTEGRATION is set to
+    True, logs are formatted as a JSON object. This format integrates seamlessly
+    with Google Cloud Logging, making logs searchable, filterable, and automatically
+    parsed with the correct severity and source location.
+    This is the recommended setting for deployments on Cloud Run or GKE.
